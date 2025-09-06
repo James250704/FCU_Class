@@ -29,18 +29,18 @@
 
 1. 執行 GUI 介面：
     ```bash
-    uv run gui_qt.py
+    uv run main.py
     ```
     或
     ```bash
-    python gui_qt.py
+    python main.py
     ```
 2. 依照介面操作，開始自動選課
 
 ## 主要檔案說明
 
--   `main.py`：核心選課流程
--   `gui_qt.py`：GUI 介面
+-   `main.py`：GUI 介面
+-   `course.py`：核心選課流程
 -   `config.ini`：使用者設定檔
 -   `requirements.txt`：依賴套件清單
 
