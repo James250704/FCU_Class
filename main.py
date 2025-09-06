@@ -2,6 +2,7 @@ import os
 import re
 import json
 import pickle
+import time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -49,7 +50,7 @@ def _parse_tb_ids(raw: str) -> list[str]:
 
 
 def load_config(path: str | Path = "config.ini"):
-    """讀取 config.ini 取得 NID、PASS、tbSubIDs(list)"""
+    """讀取 config.ini 取得 NID、PASS、tbSubIDs(list) 以及重試設定"""
     cfg = ConfigParser()
     default_path = (
         Path(__file__).with_name("config.ini")
@@ -68,9 +69,15 @@ def load_config(path: str | Path = "config.ini"):
         elif cfg.has_option("course", "tbSubID"):
             tb_raw = cfg.get("course", "tbSubID")  # 仍相容單值或多值字串
         tb_ids = _parse_tb_ids(tb_raw)
+
+        # 讀取重試設定
+        retry_enabled = cfg.getboolean("retry", "enabled", fallback=False)
+        retry_count = cfg.getint("retry", "count", fallback=3)
+        retry_interval = cfg.getint("retry", "interval", fallback=30)
+
         if not nid or not pwd or not tb_ids:
             raise ValueError("NID / PASS / tbSubIDs 不能為空")
-        return nid, pwd, tb_ids
+        return nid, pwd, tb_ids, retry_enabled, retry_count, retry_interval
     except Exception as e:
         raise ValueError(f"設定檔內容不完整或格式錯誤：{e}")
 
@@ -246,8 +253,9 @@ def find_add_event_args(html: str) -> list[str]:
     return ordered
 
 
-def main():
-    NID, PASS, TB_SUB_IDS = load_config()
+def main(stop_check_func=None):
+    config_result = load_config()
+    NID, PASS, TB_SUB_IDS, RETRY_ENABLED, RETRY_COUNT, RETRY_INTERVAL = config_result
     session = make_session()
 
     have_cookies = load_cookies_if_any(session)
@@ -268,17 +276,81 @@ def main():
 
     add_withdraw_url = f"{base}/AddWithdraw.aspx?guid={guid}&lang={lang}"
 
+    # 如果啟用重試，則進行多輪重試
+    if RETRY_ENABLED:
+        if RETRY_COUNT == 0:
+            print(f"✅ 啟用無限重試功能，每次間隔 {RETRY_INTERVAL} 秒")
+        else:
+            print(
+                f"✅ 啟用自動重試功能，將重試 {RETRY_COUNT} 次，每次間隔 {RETRY_INTERVAL} 秒"
+            )
+
+        retry_round = 0
+        while True:
+            if stop_check_func and stop_check_func():
+                print("⚠️ 收到停止信號，中斷重試")
+                break
+
+            retry_round += 1
+            if RETRY_COUNT == 0:
+                print(f"\n===== 第 {retry_round} 輪重試 （無限重試模式）=====")
+            else:
+                print(f"\n===== 第 {retry_round} 輪重試 =====")
+
+            all_success = process_course_selection(
+                session, add_withdraw_url, TB_SUB_IDS, stop_check_func
+            )
+
+            if all_success:
+                print(f"🎉 所有課程選課成功！")
+                break
+
+            # 檢查是否達到重試次數限制（0 表示無限重試）
+            if RETRY_COUNT > 0 and retry_round >= RETRY_COUNT:
+                print("❌ 重試次數已達上限，選課結束")
+                break
+
+            # 等待間隔時間
+            if RETRY_INTERVAL > 0:
+                print(f"⏳ 等待 {RETRY_INTERVAL} 秒後進行下一輪重試...")
+                for i in range(RETRY_INTERVAL):
+                    if stop_check_func and stop_check_func():
+                        print("⚠️ 收到停止信號，中斷等待")
+                        return
+                    time.sleep(1)
+            else:
+                # 間隔為 0 秒，但仍需短暫延遲避免過快重試
+                if stop_check_func and stop_check_func():
+                    print("⚠️ 收到停止信號，中斷重試")
+                    return
+                time.sleep(0.1)  # 100ms 的最小延遲
+    else:
+        # 不啟用重試，執行單次選課
+        process_course_selection(session, add_withdraw_url, TB_SUB_IDS, stop_check_func)
+
+    print("\n===== 選課結束 =====")
+
+
+def process_course_selection(
+    session, add_withdraw_url, TB_SUB_IDS, stop_check_func=None
+):
+    """處理課程選課，返回是否全部成功"""
+    all_success = True
+
     # 逐科處理
     for idx, sub_id in enumerate(TB_SUB_IDS, start=1):
+        if stop_check_func and stop_check_func():
+            print("⚠️ 收到停止信號，停止選課")
+            return False
+
         print(f"\n===== 第 {idx} 科：{sub_id} =====")
 
         # 進入頁面拿初始隱藏欄位
         r = session.get(add_withdraw_url, allow_redirects=True)
         if is_session_timeout(r.text) or is_login_page(r.text):
-            print("⚠️ 會話失效，重新登入")
-            guid, lang, base = do_login(session, NID, PASS)
-            add_withdraw_url = f"{base}/AddWithdraw.aspx?guid={guid}&lang={lang}"
-            r = session.get(add_withdraw_url, allow_redirects=True)
+            print("⚠️ 會話失效，需要重新登入")
+            all_success = False
+            continue
 
         vs, vg, ev = get_hidden_fields(r.text, dump_name=f"aw_{sub_id}_page.html")
 
@@ -312,10 +384,15 @@ def main():
             )
             if msg:
                 print("訊息：", msg.get_text(strip=True))
+            all_success = False
             continue
 
         success = False
         for ea in event_args:
+            if stop_check_func and stop_check_func():
+                print("⚠️ 收到停止信號，停止選課")
+                return False
+
             add_data = {
                 "ctl00_ToolkitScriptManager1_HiddenField": "",
                 "ctl00_MainContent_TabContainer1_ClientState": '{"ActiveTabIndex":1,"TabState":[true,true]}',
@@ -355,8 +432,9 @@ def main():
 
         if not success:
             print(f"→ 科目 {sub_id} 未成功加選。")
+            all_success = False
 
-    print("\n===== 選課結束 =====")
+    return all_success
 
 
 if __name__ == "__main__":

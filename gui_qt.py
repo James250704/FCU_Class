@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QMessageBox,
     QCheckBox,
+    QSpinBox,
 )
 
 
@@ -94,6 +95,9 @@ class Runner:
             "收到停止請求：將在目前請求結束後停止（若網站阻塞可能需等待）。\n"
         )
 
+    def is_stopped(self):
+        return self._stop_flag
+
     def _run(self):
         try:
             run_main = import_run_main()
@@ -108,7 +112,8 @@ class Runner:
         qstream_err = QtStream(emitter)
         try:
             with redirect_stdout(qstream_out), redirect_stderr(qstream_err):
-                run_main()
+                # 傳遞停止檢查函數給 main.main()
+                run_main(stop_check_func=self.is_stopped)
         except SystemExit:
             pass
         except Exception as e:
@@ -133,6 +138,21 @@ class MainWin(QWidget):
         self.ed_tb = QTextEdit()
         self.ed_tb.setPlaceholderText("課程代號清單：可逗號、空白、換行或 JSON 陣列")
         self._set_two_line_height(self.ed_tb)  # 兩行高度
+
+        # 重試設定
+        self.ck_retry = QCheckBox("啟用自動重試")
+        self.ck_retry.setTristate(False)
+        self.sp_retry_count = QSpinBox()
+        self.sp_retry_count.setMinimum(0)  # 0 表示無限重試
+        self.sp_retry_count.setMaximum(999)
+        self.sp_retry_count.setValue(3)  # 預設重試 3 次
+        self.sp_retry_count.setSuffix(" 次")
+        self.sp_retry_count.setSpecialValueText("無限重試")  # 當值為 0 時顯示
+        self.sp_retry_interval = QSpinBox()
+        self.sp_retry_interval.setMinimum(0)  # 0 秒間隔
+        self.sp_retry_interval.setMaximum(3600)
+        self.sp_retry_interval.setValue(30)  # 預設間隔 30 秒
+        self.sp_retry_interval.setSuffix(" 秒")
 
         # 按鈕
         self.btn_load = QPushButton("讀取 config.ini")
@@ -162,6 +182,23 @@ class MainWin(QWidget):
 
         top.addWidget(QLabel("課程代號(使用,逗號分隔)"))
         top.addWidget(self.ed_tb)
+
+        # 重試設定區域
+        retry_layout = QVBoxLayout()
+        retry_row1 = QHBoxLayout()
+        retry_row1.addWidget(self.ck_retry)
+        retry_row1.addStretch()
+        retry_layout.addLayout(retry_row1)
+
+        retry_row2 = QHBoxLayout()
+        retry_row2.addWidget(QLabel("重試次數"))
+        retry_row2.addWidget(self.sp_retry_count)
+        retry_row2.addWidget(QLabel("重試間隔"))
+        retry_row2.addWidget(self.sp_retry_interval)
+        retry_row2.addStretch()
+        retry_layout.addLayout(retry_row2)
+
+        top.addLayout(retry_layout)
 
         row3 = QHBoxLayout()
         row3.addWidget(self.btn_load)
@@ -224,9 +261,19 @@ class MainWin(QWidget):
                 tb = cfg.get("course", "tbSubIDs", fallback="")
             elif cfg.has_option("course", "tbSubID"):
                 tb = cfg.get("course", "tbSubID", fallback="")
+
+            # 讀取重試設定
+            retry_enabled = cfg.getboolean("retry", "enabled", fallback=False)
+            retry_count = cfg.getint("retry", "count", fallback=3)
+            retry_interval = cfg.getint("retry", "interval", fallback=30)
+
             self.ed_nid.setText(nid)
             self.ed_pwd.setText(pwd)
             self.ed_tb.setPlainText(tb)
+            self.ck_retry.setChecked(retry_enabled)
+            self.sp_retry_count.setValue(retry_count)
+            self.sp_retry_interval.setValue(retry_interval)
+
             self.append_log("已載入 config.ini。\n")
         except Exception as e:
             QMessageBox.critical(self, "讀取錯誤", str(e))
@@ -238,9 +285,16 @@ class MainWin(QWidget):
         if not nid or not pwd or not tb:
             QMessageBox.warning(self, "缺少欄位", "NID / PASS / tbSubIDs 不可為空。")
             return
+
         cfg = configparser.ConfigParser()
         cfg["auth"] = {"NID": nid, "PASS": pwd}
         cfg["course"] = {"tbSubIDs": tb}
+        cfg["retry"] = {
+            "enabled": str(self.ck_retry.isChecked()),
+            "count": str(self.sp_retry_count.value()),
+            "interval": str(self.sp_retry_interval.value()),
+        }
+
         try:
             with open(INI, "w", encoding="utf-8") as f:
                 cfg.write(f)
