@@ -16,8 +16,13 @@ BASE = "https://course.fcu.edu.tw"
 COOKIE_FILE = Path("cookies.pkl")
 SESSION_META = Path("session.json")
 
+ENABLE_FILE_DUMP = False
+
 
 def save_response_to_file(filename, content):
+    """視設定決定是否輸出網頁內容"""
+    if not ENABLE_FILE_DUMP:
+        return
     with open(filename, "w", encoding="utf-8") as f:
         f.write(content)
     print(f"✅ 網頁內容已儲存到 {filename}")
@@ -159,7 +164,8 @@ def validate_session(
         or is_session_timeout(text)
     ):
         return False
-    soup = BeautifulSoup(text, "html.parser")
+    # soup = BeautifulSoup(text, "html.parser")
+    soup = BeautifulSoup(text, "lxml")
     vs = soup.find("input", {"name": "__VIEWSTATE"})
     btn = soup.find(
         "input", {"name": "ctl00$MainContent$TabContainer1$tabSelected$btnGetSub"}
@@ -178,7 +184,8 @@ def do_login(session: requests.Session, nid: str, pwd: str):
     print("自動識別驗證碼:", captcha)
 
     r = session.get(f"{BASE}/Login.aspx")
-    soup = BeautifulSoup(r.text, "html.parser")
+    # soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(r.text, "lxml")
     viewstate = soup.find("input", {"name": "__VIEWSTATE"}).get("value", "")
     viewstategenerator = soup.find("input", {"name": "__VIEWSTATEGENERATOR"}).get(
         "value", ""
@@ -225,7 +232,7 @@ def do_login(session: requests.Session, nid: str, pwd: str):
 
 
 def get_hidden_fields(html: str, dump_name: str = "last_page.html"):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
 
     def val(name):
         el = soup.find("input", {"name": name})
@@ -235,7 +242,7 @@ def get_hidden_fields(html: str, dump_name: str = "last_page.html"):
     vg = val("__VIEWSTATEGENERATOR")
     ev = val("__EVENTVALIDATION")
     if not (vs and vg and ev):
-        Path(dump_name).write_text(html, encoding="utf-8")
+        save_response_to_file(dump_name, html)  # 只會在 ENABLE_FILE_DUMP=True 時執行
         raise RuntimeError("頁面缺少必要隱藏欄位，已落檔到 " + dump_name)
     return vs, vg, ev
 
@@ -377,7 +384,8 @@ def process_course_selection(
         if not event_args:
             print("找不到可加選按鈕，可能查無課或未開放。")
             # 顯示頁面訊息
-            soup = BeautifulSoup(r.text, "html.parser")
+            # soup = BeautifulSoup(r.text, "html.parser")
+            soup = BeautifulSoup(r.text, "lxml")
             msg = soup.find(
                 "span",
                 {"id": "ctl00_MainContent_TabContainer1_tabSelected_lblMsgBlock"},
@@ -408,7 +416,8 @@ def process_course_selection(
             }
             r = session.post(add_withdraw_url, data=add_data)
 
-            soup = BeautifulSoup(r.text, "html.parser")
+            # soup = BeautifulSoup(r.text, "html.parser")
+            soup = BeautifulSoup(r.text, "lxml")
             msg = soup.find(
                 "span",
                 {"id": "ctl00_MainContent_TabContainer1_tabSelected_lblMsgBlock"},
