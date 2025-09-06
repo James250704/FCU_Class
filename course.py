@@ -1,15 +1,10 @@
-import os
-import re
-import json
-import pickle
-import time
+import os, re, json, pickle, time, requests, ddddocr
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-
-import requests
 from bs4 import BeautifulSoup
-import ddddocr  # uv add ddddocr
 from configparser import ConfigParser
+from io import BytesIO
+from lxml import html as lxml_html
 
 
 BASE = "https://course.fcu.edu.tw"
@@ -176,11 +171,8 @@ def validate_session(
 def do_login(session: requests.Session, nid: str, pwd: str):
     session.get(f"{BASE}/")
     cap = session.get(f"{BASE}/validateCode.aspx")
-    with open("captcha.jpg", "wb") as f:
-        f.write(cap.content)
     ocr = ddddocr.DdddOcr()
-    with open("captcha.jpg", "rb") as f:
-        captcha = ocr.classification(f.read())
+    captcha = ocr.classification(cap.content)  # 直接處理，不存檔
     print("自動識別驗證碼:", captcha)
 
     r = session.get(f"{BASE}/Login.aspx")
@@ -245,6 +237,16 @@ def get_hidden_fields(html: str, dump_name: str = "last_page.html"):
         save_response_to_file(dump_name, html)  # 只會在 ENABLE_FILE_DUMP=True 時執行
         raise RuntimeError("頁面缺少必要隱藏欄位，已落檔到 " + dump_name)
     return vs, vg, ev
+
+
+def get_hidden_fields_fast(page_text):
+    tree = lxml_html.fromstring(page_text)
+    vs = tree.xpath('//input[@name="__VIEWSTATE"]/@value')
+    vg = tree.xpath('//input[@name="__VIEWSTATEGENERATOR"]/@value')
+    ev = tree.xpath('//input[@name="__EVENTVALIDATION"]/@value')
+    if not (vs and vg and ev):
+        raise RuntimeError("頁面缺少必要隱藏欄位")
+    return vs[0], vg[0], ev[0]
 
 
 def find_add_event_args(html: str) -> list[str]:
@@ -359,7 +361,7 @@ def process_course_selection(
             all_success = False
             continue
 
-        vs, vg, ev = get_hidden_fields(r.text, dump_name=f"aw_{sub_id}_page.html")
+        vs, vg, ev = get_hidden_fields_fast(r.text)
 
         # 查詢該科
         query_data = {
@@ -377,7 +379,7 @@ def process_course_selection(
             "ctl00$MainContent$TabContainer1$tabSelected$cpeWishList_ClientState": "false",
         }
         r = session.post(add_withdraw_url, data=query_data)
-        vs, vg, ev = get_hidden_fields(r.text, dump_name=f"aw_{sub_id}_query.html")
+        vs, vg, ev = get_hidden_fields_fast(r.text)
 
         # 找出所有可加選列的 __EVENTARGUMENT
         event_args = find_add_event_args(r.text)
@@ -432,9 +434,7 @@ def process_course_selection(
 
             # 更新隱藏欄位以便嘗試下一列
             try:
-                vs, vg, ev = get_hidden_fields(
-                    r.text, dump_name=f"aw_{sub_id}_after_{ea}.html"
-                )
+                vs, vg, ev = get_hidden_fields_fast(r.text)
             except Exception:
                 # 若頁面跳離或缺欄位就中止此科
                 break
