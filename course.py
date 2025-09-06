@@ -103,9 +103,17 @@ def make_session():
         "Content-Type": "application/x-www-form-urlencoded",
         "Priority": "u=0, i",
     }
-    s = requests.Session()
-    s.headers.update(headers)
-    return s
+    # s = requests.Session()
+    # s.headers.update(headers)
+    # return s
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=20, pool_maxsize=20, max_retries=3
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update(headers)
+    return session
 
 
 def load_cookies_if_any(session: requests.Session) -> bool:
@@ -346,6 +354,14 @@ def process_course_selection(
     """處理課程選課，返回是否全部成功"""
     all_success = True
 
+    # 🚀 第一次 GET AddWithdraw.aspx，拿初始隱藏欄位
+    r = session.get(add_withdraw_url, allow_redirects=True)
+    if is_session_timeout(r.text) or is_login_page(r.text):
+        print("⚠️ 初始會話失效，需要重新登入")
+        return False
+
+    vs, vg, ev = get_hidden_fields_fast(r.text)
+
     # 逐科處理
     for idx, sub_id in enumerate(TB_SUB_IDS, start=1):
         if stop_check_func and stop_check_func():
@@ -354,16 +370,7 @@ def process_course_selection(
 
         print(f"\n===== 第 {idx} 科：{sub_id} =====")
 
-        # 進入頁面拿初始隱藏欄位
-        r = session.get(add_withdraw_url, allow_redirects=True)
-        if is_session_timeout(r.text) or is_login_page(r.text):
-            print("⚠️ 會話失效，需要重新登入")
-            all_success = False
-            continue
-
-        vs, vg, ev = get_hidden_fields_fast(r.text)
-
-        # 查詢該科
+        # 🔍 查詢該科
         query_data = {
             "ctl00_ToolkitScriptManager1_HiddenField": "",
             "ctl00_MainContent_TabContainer1_ClientState": '{"ActiveTabIndex":1,"TabState":[true,true]}',
@@ -379,14 +386,18 @@ def process_course_selection(
             "ctl00$MainContent$TabContainer1$tabSelected$cpeWishList_ClientState": "false",
         }
         r = session.post(add_withdraw_url, data=query_data)
+        if is_session_timeout(r.text) or is_login_page(r.text):
+            print("⚠️ 會話失效，需要重新登入")
+            all_success = False
+            break
+
+        # 更新隱藏欄位
         vs, vg, ev = get_hidden_fields_fast(r.text)
 
-        # 找出所有可加選列的 __EVENTARGUMENT
+        # 找出所有可加選列
         event_args = find_add_event_args(r.text)
         if not event_args:
             print("找不到可加選按鈕，可能查無課或未開放。")
-            # 顯示頁面訊息
-            # soup = BeautifulSoup(r.text, "html.parser")
             soup = BeautifulSoup(r.text, "lxml")
             msg = soup.find(
                 "span",
@@ -407,7 +418,7 @@ def process_course_selection(
                 "ctl00_ToolkitScriptManager1_HiddenField": "",
                 "ctl00_MainContent_TabContainer1_ClientState": '{"ActiveTabIndex":1,"TabState":[true,true]}',
                 "__EVENTTARGET": "ctl00$MainContent$TabContainer1$tabSelected$gvToAdd",
-                "__EVENTARGUMENT": ea,  # 例如 addCourse$0
+                "__EVENTARGUMENT": ea,
                 "__LASTFOCUS": "",
                 "__VIEWSTATE": vs,
                 "__VIEWSTATEGENERATOR": vg,
@@ -418,7 +429,6 @@ def process_course_selection(
             }
             r = session.post(add_withdraw_url, data=add_data)
 
-            # soup = BeautifulSoup(r.text, "html.parser")
             soup = BeautifulSoup(r.text, "lxml")
             msg = soup.find(
                 "span",
@@ -427,7 +437,6 @@ def process_course_selection(
             text = msg.get_text(strip=True) if msg else "(無訊息)"
             print(f"訊息：{text}")
 
-            # 成功關鍵詞自行調整
             if any(k in text for k in ("成功", "已加選", "完成")):
                 success = True
                 break
@@ -436,7 +445,6 @@ def process_course_selection(
             try:
                 vs, vg, ev = get_hidden_fields_fast(r.text)
             except Exception:
-                # 若頁面跳離或缺欄位就中止此科
                 break
 
         if not success:
