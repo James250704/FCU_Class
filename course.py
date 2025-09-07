@@ -11,7 +11,32 @@ BASE = "https://course.fcu.edu.tw"
 COOKIE_FILE = Path("cookies.pkl")
 SESSION_META = Path("session.json")
 
-ENABLE_FILE_DUMP = False
+ENABLE_FILE_DUMP = False  # 是否啟用網頁內容落檔功能
+RE_SPACE = re.compile(r"\s+")
+
+X_COURSE_NAME = "string(//table[@id='ctl00_MainContent_TabContainer1_tabSelected_gvToAdd']//td[contains(@class,'gvAddWithdrawCellThree')][1])"
+X_MSG = "string(//span[@id='ctl00_MainContent_TabContainer1_tabSelected_lblMsgBlock'])"
+
+
+def _norm(s: str) -> str:
+    return RE_SPACE.sub(" ", s).strip()
+
+
+def text_xpath(page_text: str, xpath: str, default="(無訊息)") -> str:
+    """
+    用 XPath 直接取文字；支援 `string(...)` 或節點。
+    會自動壓空白。
+    """
+    try:
+        tree = lxml_html.fromstring(page_text)
+        val = tree.xpath(xpath)
+        if isinstance(val, list):
+            val = val[0] if val else ""
+        val = str(val)
+        val = _norm(val)
+        return val or default
+    except Exception:
+        return default
 
 
 def save_response_to_file(filename, content):
@@ -324,7 +349,7 @@ def main(stop_check_func=None):
 
             # 檢查是否達到重試次數限制（0 表示無限重試）
             if RETRY_COUNT > 0 and retry_round >= RETRY_COUNT:
-                print("❌ 重試次數已達上限，選課結束")
+                print("❌ 重試次數已達上限")
                 break
 
             # 等待間隔時間
@@ -368,8 +393,6 @@ def process_course_selection(
             print("⚠️ 收到停止信號，停止選課")
             return False
 
-        print(f"\n===== 第 {idx} 科：{sub_id} =====")
-
         # 🔍 查詢該科
         query_data = {
             "ctl00_ToolkitScriptManager1_HiddenField": "",
@@ -386,6 +409,10 @@ def process_course_selection(
             "ctl00$MainContent$TabContainer1$tabSelected$cpeWishList_ClientState": "false",
         }
         r = session.post(add_withdraw_url, data=query_data)
+        courseName = text_xpath(r.text, X_COURSE_NAME)
+
+        print(f"\n===== 第 {idx} 科：{sub_id} {courseName} =====")
+
         if is_session_timeout(r.text) or is_login_page(r.text):
             print("⚠️ 會話失效，需要重新登入")
             all_success = False
@@ -398,13 +425,9 @@ def process_course_selection(
         event_args = find_add_event_args(r.text)
         if not event_args:
             print("找不到可加選按鈕，可能查無課或未開放。")
-            soup = BeautifulSoup(r.text, "lxml")
-            msg = soup.find(
-                "span",
-                {"id": "ctl00_MainContent_TabContainer1_tabSelected_lblMsgBlock"},
-            )
-            if msg:
-                print("訊息：", msg.get_text(strip=True))
+            msg_txt = text_xpath(r.text, X_MSG)
+            if msg_txt and msg_txt != "(無訊息)":
+                print("訊息：", msg_txt)
             all_success = False
             continue
 
@@ -429,12 +452,7 @@ def process_course_selection(
             }
             r = session.post(add_withdraw_url, data=add_data)
 
-            soup = BeautifulSoup(r.text, "lxml")
-            msg = soup.find(
-                "span",
-                {"id": "ctl00_MainContent_TabContainer1_tabSelected_lblMsgBlock"},
-            )
-            text = msg.get_text(strip=True) if msg else "(無訊息)"
+            text = text_xpath(r.text, X_MSG)
             print(f"訊息：{text}")
 
             if any(k in text for k in ("成功", "已加選", "完成")):
@@ -448,7 +466,7 @@ def process_course_selection(
                 break
 
         if not success:
-            print(f"→ 科目 {sub_id} 未成功加選。")
+            print(f"→ 科目 {sub_id} {courseName} 未成功加選。 ")
             all_success = False
 
     return all_success
