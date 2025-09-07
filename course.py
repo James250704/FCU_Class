@@ -6,7 +6,6 @@ from configparser import ConfigParser
 from io import BytesIO
 from lxml import html as lxml_html
 
-
 BASE = "https://course.fcu.edu.tw"
 COOKIE_FILE = Path("cookies.pkl")
 SESSION_META = Path("session.json")
@@ -18,34 +17,23 @@ X_COURSE_NAME = "string(//table[@id='ctl00_MainContent_TabContainer1_tabSelected
 X_MSG = "string(//span[@id='ctl00_MainContent_TabContainer1_tabSelected_lblMsgBlock'])"
 
 
-def _norm(s: str) -> str:
-    return RE_SPACE.sub(" ", s).strip()
-
-
 def text_xpath(page_text: str, xpath: str, default="(無訊息)") -> str:
     """
-    用 XPath 直接取文字；支援 `string(...)` 或節點。
-    會自動壓空白。
+    用 XPath 直接取文字，並自動標準化空白。
+    支援 string(...) 或節點。
     """
     try:
         tree = lxml_html.fromstring(page_text)
         val = tree.xpath(xpath)
         if isinstance(val, list):
             val = val[0] if val else ""
-        val = str(val)
-        val = _norm(val)
-        return val or default
+
+        # 直接使用 re.sub 替換多餘的空白，並移除前後空白
+        normalized_val = RE_SPACE.sub(" ", str(val)).strip()
+
+        return normalized_val or default
     except Exception:
         return default
-
-
-def save_response_to_file(filename, content):
-    """視設定決定是否輸出網頁內容"""
-    if not ENABLE_FILE_DUMP:
-        return
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(content)
-    print(f"✅ 網頁內容已儲存到 {filename}")
 
 
 def _parse_tb_ids(raw: str) -> list[str]:
@@ -128,9 +116,7 @@ def make_session():
         "Content-Type": "application/x-www-form-urlencoded",
         "Priority": "u=0, i",
     }
-    # s = requests.Session()
-    # s.headers.update(headers)
-    # return s
+
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=20, pool_maxsize=20, max_retries=3
@@ -183,22 +169,35 @@ def is_session_timeout(html: str) -> bool:
 def validate_session(
     session: requests.Session, guid: str, lang: str, base: str
 ) -> bool:
+    """
+    驗證當前會話是否仍然有效，使用 lxml 進行快速解析。
+    """
     url = f"{base}/AddWithdraw.aspx?guid={guid}&lang={lang}"
-    resp = session.get(url, allow_redirects=True)
-    text = resp.text
-    if (
-        resp.url.endswith("Login.aspx")
-        or is_login_page(text)
-        or is_session_timeout(text)
-    ):
+    try:
+        # 使用一個較短的逾時時間來快速判斷連線問題
+        resp = session.get(url, allow_redirects=True, timeout=10)
+        resp.raise_for_status()  # 檢查 HTTP 狀態碼
+
+        text = resp.text
+        if is_login_page(text) or is_session_timeout(text):
+            return False
+
+        # 使用 lxml 進行快速解析
+        tree = lxml_html.fromstring(text)
+
+        # 檢查頁面是否包含必要的隱藏欄位和查詢按鈕
+        has_viewstate = bool(tree.xpath('//input[@name="__VIEWSTATE"]'))
+        has_query_btn = bool(
+            tree.xpath(
+                '//input[@name="ctl00$MainContent$TabContainer1$tabSelected$btnGetSub"]'
+            )
+        )
+
+        return has_viewstate and has_query_btn
+
+    except requests.RequestException:
+        # 如果請求失敗（例如連線逾時），則視為無效會話
         return False
-    # soup = BeautifulSoup(text, "html.parser")
-    soup = BeautifulSoup(text, "lxml")
-    vs = soup.find("input", {"name": "__VIEWSTATE"})
-    btn = soup.find(
-        "input", {"name": "ctl00$MainContent$TabContainer1$tabSelected$btnGetSub"}
-    )
-    return bool(vs and btn)
 
 
 def do_login(session: requests.Session, nid: str, pwd: str):
@@ -209,13 +208,10 @@ def do_login(session: requests.Session, nid: str, pwd: str):
     print("自動識別驗證碼:", captcha)
 
     r = session.get(f"{BASE}/Login.aspx")
-    # soup = BeautifulSoup(r.text, "html.parser")
-    soup = BeautifulSoup(r.text, "lxml")
-    viewstate = soup.find("input", {"name": "__VIEWSTATE"}).get("value", "")
-    viewstategenerator = soup.find("input", {"name": "__VIEWSTATEGENERATOR"}).get(
-        "value", ""
-    )
-    eventvalidation = soup.find("input", {"name": "__EVENTVALIDATION"}).get("value", "")
+    tree = lxml_html.fromstring(r.text)
+    viewstate = tree.xpath('//input[@name="__VIEWSTATE"]/@value')[0]
+    viewstategenerator = tree.xpath('//input[@name="__VIEWSTATEGENERATOR"]/@value')[0]
+    eventvalidation = tree.xpath('//input[@name="__EVENTVALIDATION"]/@value')[0]
 
     login_data = {
         "__EVENTTARGET": "ctl00$Login1$LoginButton",
@@ -254,22 +250,6 @@ def do_login(session: requests.Session, nid: str, pwd: str):
     save_session_meta(guid, lang, base_after)
     print("登入後 cookies 已儲存到 cookies.pkl，guid/lang/base 已寫入 session.json")
     return guid, lang, base_after
-
-
-def get_hidden_fields(html: str, dump_name: str = "last_page.html"):
-    soup = BeautifulSoup(html, "lxml")
-
-    def val(name):
-        el = soup.find("input", {"name": name})
-        return el.get("value", "") if el else ""
-
-    vs = val("__VIEWSTATE")
-    vg = val("__VIEWSTATEGENERATOR")
-    ev = val("__EVENTVALIDATION")
-    if not (vs and vg and ev):
-        save_response_to_file(dump_name, html)  # 只會在 ENABLE_FILE_DUMP=True 時執行
-        raise RuntimeError("頁面缺少必要隱藏欄位，已落檔到 " + dump_name)
-    return vs, vg, ev
 
 
 def get_hidden_fields_fast(page_text):
