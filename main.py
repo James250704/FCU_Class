@@ -323,6 +323,7 @@ class MainWin(QWidget):
             self.append_log(f"Cookie 清理完成，共刪除 {removed} 個檔案。\n")
 
     def run_job(self):
+        self.log.clear()
         self.save_ini()
         self.runner.start()
         self.append_log("開始執行。\n")
