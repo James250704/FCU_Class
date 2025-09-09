@@ -18,7 +18,7 @@ X_COURSE_NAME = "string(//table[@id='ctl00_MainContent_TabContainer1_tabSelected
 X_MSG = "string(//span[@id='ctl00_MainContent_TabContainer1_tabSelected_lblMsgBlock'])"
 
 
-def text_xpath(page_text: str, xpath: str, default="(無訊息)") -> str:
+def text_xpath(page_text: str, xpath: str, default="") -> str:
     """
     用 XPath 直接取文字，並自動標準化空白。
     支援 string(...) 或節點。
@@ -424,8 +424,7 @@ def process_course_selection(
         }
         r = session.post(add_withdraw_url, data=query_data)
         courseName = text_xpath(r.text, X_COURSE_NAME)
-
-        print(f"\n===== 第 {idx} 科：{sub_id} {courseName} =====")
+        last_msg = "無加選按鈕"
 
         if is_session_timeout(r.text) or is_login_page(r.text):
             print("⚠️ 會話失效，需要重新登入")
@@ -438,10 +437,9 @@ def process_course_selection(
         # 找出所有可加選列
         event_args = find_add_event_args(r.text)
         if not event_args:
-            print("找不到可加選按鈕，可能查無課或未開放。")
             msg_txt = text_xpath(r.text, X_MSG)
-            if msg_txt and msg_txt != "(無訊息)":
-                print("訊息：", msg_txt)
+            last_msg = msg_txt or last_msg
+            print(f'❌ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
             all_success = False
             continue
 
@@ -467,7 +465,7 @@ def process_course_selection(
             r = session.post(add_withdraw_url, data=add_data)
 
             text_msg = text_xpath(r.text, X_MSG)
-            print(f"訊息：{text_msg}")
+            last_msg = text_msg or last_msg
 
             if "系統偵測異常" in text_msg:
                 try:
@@ -476,6 +474,7 @@ def process_course_selection(
                         print("🗑️ 已刪除 cookies 檔案 (系統偵測異常)")
                 except Exception as e:
                     print(f"刪除 cookies 失敗: {e}")
+                print(f'❌ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
                 return False, True
 
             if any(k in text_msg for k in ("成功", "已加選", "完成")):
@@ -489,8 +488,10 @@ def process_course_selection(
                 break
 
         if not success:
-            print(f"→ 科目 {sub_id} {courseName} 未成功加選。 ")
+            print(f'❌ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
             all_success = False
+        else:
+            print(f'✅ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
 
     return all_success, need_relogin
 
