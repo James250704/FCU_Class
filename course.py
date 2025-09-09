@@ -1,4 +1,5 @@
 import os, re, json, pickle, time, requests, ddddocr
+from requests.adapters import HTTPAdapter
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup
@@ -118,9 +119,7 @@ def make_session():
     }
 
     session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=20, pool_maxsize=20, max_retries=3
-    )
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=3)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update(headers)
@@ -319,9 +318,28 @@ def main(stop_check_func=None):
             else:
                 print(f"\n===== 第 {retry_round} 輪重試 =====")
 
-            all_success = process_course_selection(
+            all_success, need_relogin = process_course_selection(
                 session, add_withdraw_url, TB_SUB_IDS, stop_check_func
             )
+            if need_relogin:
+                print("🔄 偵測到『系統偵測異常』，執行重新登入...")
+                session = make_session()
+                try:
+                    guid, lang, base = do_login(session, NID, PASS)
+                    add_withdraw_url = (
+                        f"{base}/AddWithdraw.aspx?guid={guid}&lang={lang}"
+                    )
+                except Exception as e:
+                    print(f"❌ 重新登入失敗：{e}")
+                    break
+                if RETRY_INTERVAL > 0:
+                    print(f"⏳ 等待 {RETRY_INTERVAL} 秒後再次嘗試...")
+                    for i in range(RETRY_INTERVAL):
+                        if stop_check_func and stop_check_func():
+                            print("⚠️ 收到停止信號，中斷等待")
+                            return
+                        time.sleep(1)
+                continue
 
             if all_success:
                 print(f"🎉 所有課程選課成功！")
@@ -347,8 +365,20 @@ def main(stop_check_func=None):
                     return
                 time.sleep(0.1)  # 100ms 的最小延遲
     else:
-        # 不啟用重試，執行單次選課
-        process_course_selection(session, add_withdraw_url, TB_SUB_IDS, stop_check_func)
+        all_success, need_relogin = process_course_selection(
+            session, add_withdraw_url, TB_SUB_IDS, stop_check_func
+        )
+        if need_relogin:
+            print("🔄 偵測到『系統偵測異常』，重新登入後再嘗試一次...")
+            session = make_session()
+            try:
+                guid, lang, base = do_login(session, NID, PASS)
+                add_withdraw_url = f"{base}/AddWithdraw.aspx?guid={guid}&lang={lang}"
+                process_course_selection(
+                    session, add_withdraw_url, TB_SUB_IDS, stop_check_func
+                )
+            except Exception as e:
+                print(f"❌ 重新登入失敗：{e}")
 
     print("\n===== 選課結束 =====")
 
@@ -356,14 +386,18 @@ def main(stop_check_func=None):
 def process_course_selection(
     session, add_withdraw_url, TB_SUB_IDS, stop_check_func=None
 ):
-    """處理課程選課，返回是否全部成功"""
+    """處理課程選課
+    回傳 (all_success, need_relogin)
+    need_relogin: 是否因『系統偵測異常』需要重新登入
+    """
     all_success = True
+    need_relogin = False
 
     # 🚀 第一次 GET AddWithdraw.aspx，拿初始隱藏欄位
     r = session.get(add_withdraw_url, allow_redirects=True)
     if is_session_timeout(r.text) or is_login_page(r.text):
         print("⚠️ 初始會話失效，需要重新登入")
-        return False
+        return False, False
 
     vs, vg, ev = get_hidden_fields_fast(r.text)
 
@@ -371,7 +405,7 @@ def process_course_selection(
     for idx, sub_id in enumerate(TB_SUB_IDS, start=1):
         if stop_check_func and stop_check_func():
             print("⚠️ 收到停止信號，停止選課")
-            return False
+            return False, False
 
         # 🔍 查詢該科
         query_data = {
@@ -415,7 +449,7 @@ def process_course_selection(
         for ea in event_args:
             if stop_check_func and stop_check_func():
                 print("⚠️ 收到停止信號，停止選課")
-                return False
+                return False, False
 
             add_data = {
                 "ctl00_ToolkitScriptManager1_HiddenField": "",
@@ -432,10 +466,19 @@ def process_course_selection(
             }
             r = session.post(add_withdraw_url, data=add_data)
 
-            text = text_xpath(r.text, X_MSG)
-            print(f"訊息：{text}")
+            text_msg = text_xpath(r.text, X_MSG)
+            print(f"訊息：{text_msg}")
 
-            if any(k in text for k in ("成功", "已加選", "完成")):
+            if "系統偵測異常" in text_msg:
+                try:
+                    if COOKIE_FILE.exists():
+                        COOKIE_FILE.unlink()
+                        print("🗑️ 已刪除 cookies 檔案 (系統偵測異常)")
+                except Exception as e:
+                    print(f"刪除 cookies 失敗: {e}")
+                return False, True
+
+            if any(k in text_msg for k in ("成功", "已加選", "完成")):
                 success = True
                 break
 
@@ -449,7 +492,7 @@ def process_course_selection(
             print(f"→ 科目 {sub_id} {courseName} 未成功加選。 ")
             all_success = False
 
-    return all_success
+    return all_success, need_relogin
 
 
 if __name__ == "__main__":
