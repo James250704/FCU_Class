@@ -16,6 +16,9 @@ RE_SPACE = re.compile(r"\s+")
 
 X_COURSE_NAME = "string(//table[@id='ctl00_MainContent_TabContainer1_tabSelected_gvToAdd']//td[contains(@class,'gvAddWithdrawCellThree')][1])"
 X_MSG = "string(//span[@id='ctl00_MainContent_TabContainer1_tabSelected_lblMsgBlock'])"
+# 假設餘額資訊在表格的特定位置，根據頁面結構調整此 XPath
+# 例如，如果餘額在第 4 個 td，可以改為 td[4]；這裡假設為 gvAddWithdrawCellQuota 或類似
+X_QUOTA = "string(//table[@id='ctl00_MainContent_TabContainer1_tabSelected_gvToAdd']//tr[2]/td[4])"  # 請根據實際頁面調整 XPath
 
 
 def text_xpath(page_text: str, xpath: str, default="") -> str:
@@ -199,10 +202,13 @@ def validate_session(
         return False
 
 
-def do_login(session: requests.Session, nid: str, pwd: str):
+OCR_ENGINE = ddddocr.DdddOcr()
+
+
+def do_login(session: requests.Session, nid: str, pwd: str, OCR_ENGINE=OCR_ENGINE):
     session.get(f"{BASE}/")
     cap = session.get(f"{BASE}/validateCode.aspx")
-    ocr = ddddocr.DdddOcr()
+    ocr = OCR_ENGINE
     captcha = ocr.classification(cap.content)  # 直接處理，不存檔
     print("自動識別驗證碼:", captcha)
 
@@ -272,6 +278,78 @@ def find_add_event_args(html: str) -> list[str]:
             seen.add(arg)
             ordered.append(arg)
     return ordered
+
+
+def parse_quota_info(quota_info: str) -> int:
+    """解析 quota_info 字符串，提取剩餘名額。
+    假設格式：'剩餘名額/開放名額：X  /Y'
+    回傳 X，如果解析失敗回傳 0
+    """
+    try:
+        match = re.search(r"剩餘名額/開放名額：(\d+)\s*/\d+", quota_info)
+        if match:
+            return int(match.group(1))
+        return 0
+    except Exception:
+        return 0
+
+
+def query_course_quota(session, add_withdraw_url, sub_id, vs, vg, ev):
+    """
+    單獨函數：查詢課程並查詢其餘額。
+    回傳 (courseName, quota_info, quota_msg, new_vs, new_vg, new_ev, quota_html)
+    如果失敗，quota_info 為 "未知"
+    """
+    # 🔍 查詢該科
+    query_data = {
+        "ctl00_ToolkitScriptManager1_HiddenField": "",
+        "ctl00_MainContent_TabContainer1_ClientState": '{"ActiveTabIndex":1,"TabState":[true,true]}',
+        "__EVENTTARGET": "",
+        "__EVENTARGUMENT": "",
+        "__LASTFOCUS": "",
+        "__VIEWSTATE": vs,
+        "__VIEWSTATEGENERATOR": vg,
+        "__VIEWSTATEENCRYPTED": "",
+        "__EVENTVALIDATION": ev,
+        "ctl00$MainContent$TabContainer1$tabSelected$tbSubID": sub_id,
+        "ctl00$MainContent$TabContainer1$tabSelected$btnGetSub": "查詢",
+        "ctl00$MainContent$TabContainer1$tabSelected$cpeWishList_ClientState": "false",
+    }
+    r = session.post(add_withdraw_url, data=query_data)
+    courseName = text_xpath(r.text, X_COURSE_NAME)
+
+    if is_session_timeout(r.text) or is_login_page(r.text):
+        raise RuntimeError("會話失效，需要重新登入")
+
+    # 更新隱藏欄位
+    vs, vg, ev = get_hidden_fields_fast(r.text)
+
+    # 查詢餘額（假設查詢後該課程為第一個選項，使用 selquota$0）
+    quota_data = {
+        "ctl00_ToolkitScriptManager1_HiddenField": "",
+        "ctl00_MainContent_TabContainer1_ClientState": '{"ActiveTabIndex":1,"TabState":[true,true]}',
+        "__EVENTTARGET": "ctl00$MainContent$TabContainer1$tabSelected$gvToAdd",
+        "__EVENTARGUMENT": "selquota$0",  # 假設第一個選項
+        "__LASTFOCUS": "",
+        "__VIEWSTATE": vs,
+        "__VIEWSTATEGENERATOR": vg,
+        "__VIEWSTATEENCRYPTED": "",
+        "__EVENTVALIDATION": ev,
+        "ctl00$MainContent$TabContainer1$tabSelected$tbSubID": sub_id,
+        "ctl00$MainContent$TabContainer1$tabSelected$cpeWishList_ClientState": "false",
+    }
+    quota_r = session.post(add_withdraw_url, data=quota_data)
+    quota_msg = text_xpath(quota_r.text, X_MSG)
+
+    # 提取 alert 資訊
+    alert_pattern = re.compile(r"alert\s*\(\s*['\"](.*?)['\"]\s*\)", re.DOTALL)
+    alert_match = alert_pattern.search(quota_r.text)
+    quota_info = alert_match.group(1).strip() if alert_match else "未知"
+
+    # 更新隱藏欄位
+    new_vs, new_vg, new_ev = get_hidden_fields_fast(quota_r.text)
+
+    return courseName, quota_info, quota_msg, new_vs, new_vg, new_ev, quota_r.text
 
 
 def main(stop_check_func=None):
@@ -407,91 +485,92 @@ def process_course_selection(
             print("⚠️ 收到停止信號，停止選課")
             return False, False
 
-        # 🔍 查詢該科
-        query_data = {
-            "ctl00_ToolkitScriptManager1_HiddenField": "",
-            "ctl00_MainContent_TabContainer1_ClientState": '{"ActiveTabIndex":1,"TabState":[true,true]}',
-            "__EVENTTARGET": "",
-            "__EVENTARGUMENT": "",
-            "__LASTFOCUS": "",
-            "__VIEWSTATE": vs,
-            "__VIEWSTATEGENERATOR": vg,
-            "__VIEWSTATEENCRYPTED": "",
-            "__EVENTVALIDATION": ev,
-            "ctl00$MainContent$TabContainer1$tabSelected$tbSubID": sub_id,
-            "ctl00$MainContent$TabContainer1$tabSelected$btnGetSub": "查詢",
-            "ctl00$MainContent$TabContainer1$tabSelected$cpeWishList_ClientState": "false",
-        }
-        r = session.post(add_withdraw_url, data=query_data)
-        courseName = text_xpath(r.text, X_COURSE_NAME)
-        last_msg = "無加選按鈕"
-
-        if is_session_timeout(r.text) or is_login_page(r.text):
-            print("⚠️ 會話失效，需要重新登入")
-            all_success = False
-            break
-
-        # 更新隱藏欄位
-        vs, vg, ev = get_hidden_fields_fast(r.text)
-
-        # 找出所有可加選列
-        event_args = find_add_event_args(r.text)
-        if not event_args:
-            msg_txt = text_xpath(r.text, X_MSG)
-            last_msg = msg_txt or last_msg
-            print(f'❌ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
-            all_success = False
-            continue
-
         success = False
-        for ea in event_args:
-            if stop_check_func and stop_check_func():
-                print("⚠️ 收到停止信號，停止選課")
-                return False, False
-
-            add_data = {
-                "ctl00_ToolkitScriptManager1_HiddenField": "",
-                "ctl00_MainContent_TabContainer1_ClientState": '{"ActiveTabIndex":1,"TabState":[true,true]}',
-                "__EVENTTARGET": "ctl00$MainContent$TabContainer1$tabSelected$gvToAdd",
-                "__EVENTARGUMENT": ea,
-                "__LASTFOCUS": "",
-                "__VIEWSTATE": vs,
-                "__VIEWSTATEGENERATOR": vg,
-                "__VIEWSTATEENCRYPTED": "",
-                "__EVENTVALIDATION": ev,
-                "ctl00$MainContent$TabContainer1$tabSelected$tbSubID": sub_id,
-                "ctl00$MainContent$TabContainer1$tabSelected$cpeWishList_ClientState": "false",
-            }
-            r = session.post(add_withdraw_url, data=add_data)
-
-            text_msg = text_xpath(r.text, X_MSG)
-            last_msg = text_msg or last_msg
-
-            if "系統偵測異常" in text_msg:
-                try:
-                    if COOKIE_FILE.exists():
-                        COOKIE_FILE.unlink()
-                        print("🗑️ 已刪除 cookies 檔案 (系統偵測異常)")
-                except Exception as e:
-                    print(f"刪除 cookies 失敗: {e}")
-                print(f'❌ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
-                return False, True
-
-            if any(k in text_msg for k in ("成功", "已加選", "完成")):
-                success = True
-                break
-
-            # 更新隱藏欄位以便嘗試下一列
+        while not success:
             try:
-                vs, vg, ev = get_hidden_fields_fast(r.text)
-            except Exception:
+                # 查詢課程並查詢餘額
+                courseName, quota_info, quota_msg, vs, vg, ev, quota_html = (
+                    query_course_quota(session, add_withdraw_url, sub_id, vs, vg, ev)
+                )
+                # print(
+                #     f'ℹ️ 第 {idx} 科: {sub_id} {courseName} 餘額查詢: "{quota_info}" (訊息: {quota_msg})'
+                # )
+
+                # 檢查是否有空位
+                remaining = parse_quota_info(quota_info)
+                if remaining <= 0:
+                    print(
+                        f"❌ 第 {idx} 科: {sub_id} {courseName} 無空位 ({quota_info})"
+                    )
+                    all_success = False
+                    break  # 無空位，跳到下一科或結束
+
+                # 找出所有可加選列（使用查詢餘額後的頁面）
+                event_args = find_add_event_args(quota_html)
+                last_msg = "無加選按鈕"
+                if not event_args:
+                    msg_txt = text_xpath(quota_html, X_MSG)
+                    last_msg = msg_txt or last_msg
+                    print(f'❌ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
+                    all_success = False
+                    break
+
+                for ea in event_args:
+                    if stop_check_func and stop_check_func():
+                        print("⚠️ 收到停止信號，停止選課")
+                        return False, False
+
+                    add_data = {
+                        "ctl00_ToolkitScriptManager1_HiddenField": "",
+                        "ctl00_MainContent_TabContainer1_ClientState": '{"ActiveTabIndex":1,"TabState":[true,true]}',
+                        "__EVENTTARGET": "ctl00$MainContent$TabContainer1$tabSelected$gvToAdd",
+                        "__EVENTARGUMENT": ea,
+                        "__LASTFOCUS": "",
+                        "__VIEWSTATE": vs,
+                        "__VIEWSTATEGENERATOR": vg,
+                        "__VIEWSTATEENCRYPTED": "",
+                        "__EVENTVALIDATION": ev,
+                        "ctl00$MainContent$TabContainer1$tabSelected$tbSubID": sub_id,
+                        "ctl00$MainContent$TabContainer1$tabSelected$cpeWishList_ClientState": "false",
+                    }
+                    r = session.post(add_withdraw_url, data=add_data)
+
+                    text_msg = text_xpath(r.text, X_MSG)
+                    last_msg = text_msg or last_msg
+
+                    if "系統偵測異常" in text_msg:
+                        try:
+                            if COOKIE_FILE.exists():
+                                COOKIE_FILE.unlink()
+                                print("🗑️ 已刪除 cookies 檔案 (系統偵測異常)")
+                        except Exception as e:
+                            print(f"刪除 cookies 失敗: {e}")
+                        print(f'❌ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
+                        return False, True
+
+                    if any(k in text_msg for k in ("成功", "已加選", "完成")):
+                        success = True
+                        print(f'✅ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
+                        break
+
+                    # 更新隱藏欄位以便嘗試下一列
+                    try:
+                        vs, vg, ev = get_hidden_fields_fast(r.text)
+                    except Exception:
+                        break
+
+                if not success:
+                    print(
+                        f"❌ 第 {idx} 科: {sub_id} {courseName} 加選失敗，重新查詢..."
+                    )
+
+            except RuntimeError as e:
+                print(f"⚠️ 查詢餘額失敗：{e}")
+                all_success = False
                 break
 
         if not success:
-            print(f'❌ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
             all_success = False
-        else:
-            print(f'✅ 第 {idx} 科: {sub_id} {courseName} "{last_msg}"')
 
     return all_success, need_relogin
 
